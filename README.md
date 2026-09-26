@@ -18,3 +18,11 @@ A progress bar fills up as 517 paths are scanned.
 Finally an AI analysis box appears in green with security
 fixes. The camera slowly zooms in on the glowing screen.
 Cinematic lighting, moody atmosphere, blue and red neon glow.
+
+
+
+Phase 1: WHOIS + DNS + Port Scanning
+Phase 2: XSS + SQLi + LFI + CSRF + Open Redirect
+Phase 3: 100+ hidden paths and files
+Phase 4: Security Headers + SSL
+Phase 5: Claude analyzes results and suggests fixes
