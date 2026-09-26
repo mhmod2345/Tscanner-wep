@@ -1,0 +1,1094 @@
+/
+index.html
+login
+admin
+admin.html
+admin.php
+config
+config.php
+setup
+setup.php
+video
+live
+liveview
+snapshot.jpg
+stream
+streaming
+record
+recordings
+playback
+user
+users
+password
+passwd
+system
+status
+settings
+logs
+log
+debug
+shell
+shell.php
+backup
+backup.zip
+firmware
+firmware_upgrade
+upgrade
+cgi-bin
+cgi-bin/login.cgi
+cgi-bin/admin.cgi
+temp
+temp.jpg
+data
+data.json
+api
+api/login
+api/user
+debug.cgi
+debug.log
+
+# bsam TX — Web Vulnerability Scanner v2.5
+> **For authorized penetration testing only**
+
+---
+
+## Install
+
+```bash
+pip install -r requirements.txt
+```
+
+## Usage
+
+```bash
+# Basic scan
+python scanner.py -u https://testsite.com
+
+# Full scan + AI analysis
+python scanner.py -u https://testsite.com --ai
+
+# Stealth mode (avoid WAF/IDS detection)
+python scanner.py -u https://testsite.com --stealth stealth --ai
+
+# Ghost mode (very quiet, heavy delay)
+python scanner.py -u https://testsite.com --stealth ghost
+
+# Custom wordlist + output file
+python scanner.py -u https://testsite.com -w wordlists/full500.txt -o report.json
+
+# Skip phases
+python scanner.py -u https://testsite.com --skip recon headers
+
+# High-speed scan (more threads)
+python scanner.py -u https://testsite.com --threads 40 --timeout 8
+```
+
+## Stealth Levels
+
+| Mode    | Delay          | Use Case                          |
+|---------|---------------|-----------------------------------|
+| normal  | 0.05 – 0.3s   | Fast scan, low-security targets   |
+| stealth | 0.2  – 0.9s   | WAF-protected sites               |
+| ghost   | 0.7  – 2.2s   | Heavy IDS, minimal footprint      |
+
+## Phases
+
+| Phase | Name              | What it does                                   |
+|-------|-------------------|------------------------------------------------|
+| 1     | Recon             | WHOIS · DNS · Port scan · Tech fingerprint     |
+| 2     | Web Vulns         | XSS · SQLi · LFI · CSRF · IDOR · SSRF · CMDi  |
+| 3     | Dir Discovery     | 500 paths · sensitive file detection           |
+| 4     | Headers & SSL     | Security headers · Cookie flags · TLS check    |
+| 5     | AI Analysis       | Claude analyzes results & suggests fixes       |
+
+## Severity
+
+| Level    | Meaning                        |
+|----------|--------------------------------|
+| Critical | Immediate exploitation risk    |
+| High     | Serious vulnerability          |
+| Medium   | Moderate risk                  |
+| Low      | Minor issue / info leak        |
+| Info     | Informational only             |
+
+requests>=2.31.0
+dnspython>=2.4.0
+python-whois>=0.8.0
+colorama>=0.4.6
+anthropic>=0.25.0
+urllib3>=2.0.0
+
+#!/usr/bin/env python3
+"""
+bsam TX — Web Vulnerability Scanner
+Version : 2.5  |  Release : 2024-11-01
+Author  : bsam TX
+License : For authorized testing only
+"""
+
+import argparse
+import socket
+import ssl
+import json
+import sys
+import time
+import random
+import concurrent.futures
+from datetime import datetime
+from urllib.parse import urlparse, urljoin
+
+import requests
+import dns.resolver
+import whois
+from colorama import Fore, Style, init
+import anthropic
+
+init(autoreset=True)
+requests.packages.urllib3.disable_warnings()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BANNER & PRINT HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+BANNER = r"""
+""" + Fore.RED + r"""
+╔══════════════════════════════════════════════════════════════════╗
+║  ██████╗ ███████╗ █████╗ ███╗   ███╗    ████████╗██╗  ██╗      ║
+║  ██╔══██╗██╔════╝██╔══██╗████╗ ████║       ██╔══╝╚██╗██╔╝      ║
+║  ██████╔╝███████╗███████║██╔████╔██║       ██║    ╚███╔╝       ║
+║  ██╔══██╗╚════██║██╔══██║██║╚██╔╝██║       ██║    ██╔██╗       ║
+║  ██████╔╝███████║██║  ██║██║ ╚═╝ ██║       ██║   ██╔╝ ██╗      ║
+║  ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝       ╚═╝   ╚═╝  ╚═╝      ║
+╠══════════════════════════════════════════════════════════════════╣
+║         Web Vulnerability Scanner  |  Stealth Edition           ║
+║         Version: 2.5  |  Release: 2024-11-01                    ║
+║         For authorized penetration testing only                  ║
+╚══════════════════════════════════════════════════════════════════╝
+""" + Style.RESET_ALL
+
+
+def banner():
+    print(BANNER)
+
+# ── print helpers ─────────────────────────────────────────────────────────────
+def info(msg):      print(f"{Fore.CYAN}  [*]{Style.RESET_ALL} {msg}")
+def ok(msg):        print(f"{Fore.GREEN}  [+]{Style.RESET_ALL} {msg}")
+def warn(msg):      print(f"{Fore.YELLOW}  [!]{Style.RESET_ALL} {msg}")
+def fail(msg):      print(f"{Fore.RED}  [-]{Style.RESET_ALL} {msg}")
+def progress(msg):  print(f"{Fore.MAGENTA}  [>]{Style.RESET_ALL} {msg}", end="\r", flush=True)
+
+def section(title: str):
+    w = 62
+    bar = "═" * w
+    print(f"\n{Fore.RED}{bar}")
+    print(f"  {title}")
+    print(f"{bar}{Style.RESET_ALL}")
+
+SEV_COLOR = {
+    "Critical": Fore.RED,
+    "High":     Fore.LIGHTRED_EX,
+    "Medium":   Fore.YELLOW,
+    "Low":      Fore.CYAN,
+    "Info":     Fore.WHITE,
+}
+
+def sev(level: str, msg: str):
+    c = SEV_COLOR.get(level, Fore.WHITE)
+    tag = f"[{level}]".ljust(10)
+    print(f"  {c}{tag}{Style.RESET_ALL} {msg}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STEALTH ENGINE — avoid detection during scan
+# ══════════════════════════════════════════════════════════════════════════════
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Edge/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+]
+
+ACCEPT_HEADERS = [
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "text/html,application/json,*/*;q=0.8",
+]
+
+LANGUAGES = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.8",
+    "en-US,en;q=0.5",
+    "ar,en;q=0.9",
+]
+
+
+class StealthEngine:
+    """Rotate headers, inject delays, mimic real browser traffic."""
+
+    def __init__(self, mode: str = "normal"):
+        """
+        mode: 'normal'  — light delay  (0.1–0.5s)
+              'stealth' — medium delay  (0.3–1.2s)
+              'ghost'   — heavy delay   (0.8–2.5s) — very slow but very quiet
+        """
+        self.mode = mode
+        self._delays = {
+            "normal":  (0.05, 0.3),
+            "stealth": (0.2,  0.9),
+            "ghost":   (0.7,  2.2),
+        }
+
+    def headers(self) -> dict:
+        return {
+            "User-Agent":      random.choice(USER_AGENTS),
+            "Accept":          random.choice(ACCEPT_HEADERS),
+            "Accept-Language": random.choice(LANGUAGES),
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection":      random.choice(["keep-alive", "close"]),
+            "Cache-Control":   random.choice(["no-cache", "max-age=0"]),
+            "DNT":             "1",
+        }
+
+    def wait(self):
+        lo, hi = self._delays.get(self.mode, (0.05, 0.3))
+        time.sleep(random.uniform(lo, hi))
+
+    def make_session(self) -> requests.Session:
+        s = requests.Session()
+        s.headers.update(self.headers())
+        return s
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHASE 1 — RECON
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Recon:
+    def __init__(self, domain: str, target_url: str, stealth: StealthEngine):
+        self.domain = domain
+        self.target = target_url
+        self.stealth = stealth
+        self.results = {}
+
+    def run(self) -> dict:
+        section("Phase 1 — Reconnaissance")
+        self._whois()
+        self._dns()
+        self._port_scan()
+        self._tech_detect()
+        return self.results
+
+    # ── WHOIS ─────────────────────────────────────────────────────────────────
+    def _whois(self):
+        info("WHOIS lookup ...")
+        try:
+            w = whois.whois(self.domain)
+            self.results["whois"] = {
+                "registrar":       str(w.registrar),
+                "creation_date":   str(w.creation_date),
+                "expiration_date": str(w.expiration_date),
+                "name_servers":    list(w.name_servers or []),
+                "emails":          list(w.emails or []) if isinstance(w.emails, (list, set)) else [str(w.emails or "")],
+            }
+            ok(f"Registrar : {w.registrar}")
+            ok(f"Created   : {w.creation_date}")
+            if w.emails:
+                ok(f"Email(s)  : {w.emails}")
+        except Exception as e:
+            warn(f"WHOIS failed: {e}")
+            self.results["whois"] = {}
+
+    # ── DNS ───────────────────────────────────────────────────────────────────
+    def _dns(self):
+        info("DNS enumeration ...")
+        self.results["dns"] = {}
+        for rtype in ["A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA"]:
+            try:
+                records = [str(r) for r in dns.resolver.resolve(self.domain, rtype)]
+                self.results["dns"][rtype] = records
+                ok(f"{rtype:6s}: {', '.join(records[:3])}")
+            except Exception:
+                pass
+
+        # subdomain hints from TXT / MX / NS
+        subs = set()
+        for rtype in ["MX", "NS"]:
+            for r in self.results["dns"].get(rtype, []):
+                parts = r.split(".")
+                if len(parts) > 2:
+                    subs.add(parts[0].lower().strip("0123456789"))
+        if subs:
+            ok(f"Possible subs : {', '.join(list(subs)[:6])}")
+            self.results["dns"]["possible_subdomains"] = list(subs)
+
+    # ── PORT SCAN ─────────────────────────────────────────────────────────────
+    def _port_scan(self):
+        info("Port scan (common ports) ...")
+        ports = {
+            21:"FTP", 22:"SSH", 23:"Telnet", 25:"SMTP", 53:"DNS",
+            80:"HTTP", 110:"POP3", 143:"IMAP", 443:"HTTPS",
+            445:"SMB", 3306:"MySQL", 5432:"PostgreSQL",
+            6379:"Redis", 8080:"HTTP-Alt", 8443:"HTTPS-Alt",
+            8888:"Jupyter", 9200:"Elasticsearch", 27017:"MongoDB",
+        }
+        host = urlparse(self.target).hostname
+        open_ports = {}
+
+        def chk(port, svc):
+            try:
+                s = socket.socket()
+                s.settimeout(0.8)
+                if s.connect_ex((host, port)) == 0:
+                    s.close()
+                    return port, svc
+            except Exception:
+                pass
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=40) as ex:
+            for f in concurrent.futures.as_completed(
+                    {ex.submit(chk, p, s): p for p, s in ports.items()}):
+                r = f.result()
+                if r:
+                    p, s = r
+                    open_ports[p] = s
+                    lvl = "High" if p in (21,23,3306,27017,6379,9200) else "Info"
+                    sev(lvl, f"Open port {p:5d}  ({s})")
+
+        self.results["open_ports"] = open_ports
+        if not open_ports:
+            warn("No open ports detected")
+
+    # ── TECH DETECTION ────────────────────────────────────────────────────────
+    def _tech_detect(self):
+        info("Technology fingerprinting ...")
+        try:
+            sess = self.stealth.make_session()
+            r = sess.get(self.target, timeout=10, verify=False, allow_redirects=True)
+            h = {k.lower(): v for k, v in r.headers.items()}
+            tech = []
+
+            fp_map = {
+                "server":         ("Server",   h.get("server", "")),
+                "x-powered-by":   ("Backend",  h.get("x-powered-by", "")),
+                "x-aspnet":       ("ASP.NET",  h.get("x-aspnet-version", "")),
+                "x-generator":    ("CMS",      h.get("x-generator", "")),
+            }
+            for _, (label, val) in fp_map.items():
+                if val:
+                    tech.append(f"{label}: {val}")
+                    ok(f"Fingerprint — {label}: {val}")
+
+            body = r.text.lower()
+            cms_sigs = {
+                "WordPress":  ["wp-content", "wp-includes", "wordpress"],
+                "Joomla":     ["joomla", "/components/com_"],
+                "Drupal":     ["drupal", "/sites/default/"],
+                "Laravel":    ["laravel_session", "x-xss-protection"],
+                "Django":     ["csrfmiddlewaretoken", "__admin_media_prefix__"],
+                "React":      ["react-root", "react.development"],
+                "Angular":    ["ng-version", "_nghost"],
+            }
+            for cms, sigs in cms_sigs.items():
+                if any(s in body for s in sigs):
+                    tech.append(f"Framework: {cms}")
+                    ok(f"Detected — {cms}")
+
+            self.results["technology"] = tech
+        except Exception as e:
+            warn(f"Tech detect failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHASE 2 — WEB VULNERABILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+class WebVulnScanner:
+    def __init__(self, target: str, stealth: StealthEngine, timeout: int = 10):
+        self.target  = target
+        self.stealth = stealth
+        self.timeout = timeout
+        self.findings = []
+
+    def run(self) -> list:
+        section("Phase 2 — Web Vulnerability Scan")
+        self._xss()
+        self._sqli()
+        self._open_redirect()
+        self._lfi()
+        self._csrf()
+        self._idor()
+        self._ssrf_hints()
+        self._cmd_injection()
+        return self.findings
+
+    def _get(self, url, params=None, data=None, method="GET"):
+        self.stealth.wait()
+        sess = self.stealth.make_session()
+        try:
+            if method == "POST":
+                return sess.post(url, data=data, timeout=self.timeout,
+                                 verify=False, allow_redirects=False)
+            return sess.get(url, params=params, timeout=self.timeout,
+                            verify=False, allow_redirects=False)
+        except Exception:
+            return None
+
+    # ── XSS ──────────────────────────────────────────────────────────────────
+    def _xss(self):
+        info("Testing XSS ...")
+        payloads = [
+            "<script>alert(1)</script>",
+            "'\"><script>alert(1)</script>",
+            "<img src=x onerror=alert(1)>",
+            "<svg onload=alert(1)>",
+            "javascript:alert(document.cookie)",
+        ]
+        params = ["q","search","id","name","query","input","text","s","keyword",
+                  "term","msg","message","comment","title","page","ref","url"]
+        found = False
+        for pay in payloads:
+            for param in params:
+                r = self._get(self.target, {param: pay})
+                if r and pay in r.text:
+                    sev("High", f"XSS — param={param}  payload={pay[:40]}")
+                    self.findings.append({"type":"XSS","severity":"High",
+                                          "param":param,"payload":pay,"url":r.url})
+                    found = True
+        if not found:
+            ok("XSS — none found")
+
+    # ── SQLi ─────────────────────────────────────────────────────────────────
+    def _sqli(self):
+        info("Testing SQL Injection ...")
+        payloads = ["'","' OR '1'='1","1 AND SLEEP(2)--","\" OR \"1\"=\"1",
+                    "1; DROP TABLE users--","' UNION SELECT NULL--"]
+        db_errors = ["sql syntax","mysql_fetch","ora-","syntax error",
+                     "unclosed quotation","pg_query","sqlite_","pdoexception",
+                     "warning: mysql","you have an error in your sql",
+                     "sqlstate","microsoft ole db","odbc drivers"]
+        params = ["id","user","username","product","item","category",
+                  "page","pid","uid","oid","bid","cid","ref","key"]
+        found = False
+        for pay in payloads:
+            for param in params:
+                r = self._get(self.target, {param: pay})
+                if r and any(e in r.text.lower() for e in db_errors):
+                    sev("Critical", f"SQL Injection — param={param} (DB error exposed)")
+                    self.findings.append({"type":"SQLi","severity":"Critical",
+                                          "param":param,"payload":pay,"url":r.url})
+                    found = True
+        if not found:
+            ok("SQLi — none found")
+
+    # ── Open Redirect ─────────────────────────────────────────────────────────
+    def _open_redirect(self):
+        info("Testing Open Redirect ...")
+        payloads = ["https://evil.com","//evil.com","/\\evil.com",
+                    "https:evil.com","///evil.com"]
+        params = ["redirect","url","next","return","goto","continue",
+                  "dest","destination","location","redir","target","link"]
+        found = False
+        for pay in payloads:
+            for param in params:
+                r = self._get(self.target, {param: pay})
+                if r and r.status_code in (301,302) \
+                        and "evil.com" in r.headers.get("Location",""):
+                    sev("Medium", f"Open Redirect — param={param}")
+                    self.findings.append({"type":"Open Redirect","severity":"Medium",
+                                          "param":param})
+                    found = True
+        if not found:
+            ok("Open Redirect — none found")
+
+    # ── LFI ──────────────────────────────────────────────────────────────────
+    def _lfi(self):
+        info("Testing LFI / Path Traversal ...")
+        payloads = ["../../../etc/passwd","....//....//etc/passwd",
+                    "%2e%2e%2fetc%2fpasswd","..%2f..%2f..%2fetc%2fpasswd",
+                    "/etc/passwd%00","....\\....\\....\\windows\\win.ini"]
+        params = ["file","page","include","template","path","doc",
+                  "load","view","read","fetch","content","f"]
+        found = False
+        for pay in payloads:
+            for param in params:
+                r = self._get(self.target, {param: pay})
+                if r and ("root:x:" in r.text or "[boot loader]" in r.text
+                          or "[fonts]" in r.text):
+                    sev("Critical", f"LFI confirmed — param={param}")
+                    self.findings.append({"type":"LFI","severity":"Critical",
+                                          "param":param,"payload":pay,"url":r.url})
+                    found = True
+        if not found:
+            ok("LFI — none found")
+
+    # ── CSRF ─────────────────────────────────────────────────────────────────
+    def _csrf(self):
+        info("Testing CSRF ...")
+        r = self._get(self.target)
+        if r:
+            tokens = ["csrf","_token","authenticity_token",
+                      "__requestverificationtoken","csrfmiddlewaretoken"]
+            if not any(t in r.text.lower() for t in tokens):
+                sev("Medium", "No CSRF token found on main page")
+                self.findings.append({"type":"CSRF","severity":"Medium",
+                                      "detail":"No CSRF token detected"})
+            else:
+                ok("CSRF token present")
+
+    # ── IDOR ─────────────────────────────────────────────────────────────────
+    def _idor(self):
+        info("Testing IDOR ...")
+        test_ids = [0, 1, 2, 99, 1000, -1]
+        params   = ["id","uid","user_id","account","profile","order"]
+        baseline = self._get(self.target)
+        baseline_len = len(baseline.text) if baseline else 0
+        found = False
+        for param in params:
+            prev = None
+            for i in test_ids:
+                r = self._get(self.target, {param: i})
+                if r and r.status_code == 200:
+                    if prev is not None and abs(len(r.text) - prev) > 200:
+                        sev("Medium", f"Possible IDOR — param={param} id={i} "
+                                      f"(response size changes per ID)")
+                        self.findings.append({"type":"IDOR","severity":"Medium",
+                                              "param":param,"id":i})
+                        found = True
+                        break
+                    prev = len(r.text) if r else prev
+        if not found:
+            ok("IDOR — none detected")
+
+    # ── SSRF hints ────────────────────────────────────────────────────────────
+    def _ssrf_hints(self):
+        info("Testing SSRF hints ...")
+        payloads = ["http://127.0.0.1","http://localhost",
+                    "http://169.254.169.254/latest/meta-data/"]
+        params   = ["url","endpoint","api","fetch","proxy","target","src"]
+        found = False
+        for pay in payloads:
+            for param in params:
+                r = self._get(self.target, {param: pay})
+                if r and r.status_code == 200 and len(r.text) > 50:
+                    sev("High", f"SSRF hint — param={param} responded to internal IP")
+                    self.findings.append({"type":"SSRF","severity":"High",
+                                          "param":param,"payload":pay})
+                    found = True
+        if not found:
+            ok("SSRF — none detected")
+
+    # ── Command Injection ─────────────────────────────────────────────────────
+    def _cmd_injection(self):
+        info("Testing Command Injection ...")
+        payloads = ["; id", "| id", "`id`", "$(id)", "; sleep 2", "| sleep 2"]
+        sigs     = ["uid=","root","www-data","apache","nginx"]
+        params   = ["cmd","exec","command","run","shell","ping","ip","host","query"]
+        found = False
+        for pay in payloads:
+            for param in params:
+                r = self._get(self.target, {param: pay})
+                if r and any(s in r.text for s in sigs):
+                    sev("Critical", f"Command Injection — param={param}")
+                    self.findings.append({"type":"CMDi","severity":"Critical",
+                                          "param":param,"payload":pay})
+                    found = True
+        if not found:
+            ok("Command Injection — none found")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHASE 3 — DIRECTORY & FILE DISCOVERY
+# ══════════════════════════════════════════════════════════════════════════════
+
+SENSITIVE_KEYS = [
+    ".env",".git","config","backup","admin","db","sql","shell",
+    "phpinfo","passwd","secret","token","key","credentials","private",
+    "password","htpasswd","shadow","id_rsa","docker","kubernetes",
+]
+
+DEFAULT_WORDLIST = [
+    # ── Admin & Auth ──────────────────────────────────────────────────────────
+    "admin","administrator","login","wp-admin","phpmyadmin","panel",
+    "dashboard","cpanel","webmaster","controlpanel","manage","manager",
+    "management","moderator","superadmin","sysadmin","user/login",
+    "users/sign_in","auth","auth/login","authenticate","signin","signup",
+    "register","forgot-password","reset-password","two-factor","2fa",
+    "oauth","oauth/authorize","oauth/token","sso","saml","ldap",
+    # ── Config & Secrets ──────────────────────────────────────────────────────
+    ".env",".env.local",".env.production",".env.staging",".env.backup",
+    ".env.old",".env.example",".env.dev",".env.test",
+    ".gitignore",".gitconfig",".git",".git/config",".git/HEAD",
+    ".git/COMMIT_EDITMSG",".git/index",".git/logs/HEAD",
+    "config.php","wp-config.php","config.yml","config.yaml","config.json",
+    "config.xml","config.ini","config.toml","configuration.php",
+    "settings.py","settings.php","settings.ini","settings.json",
+    "database.yml","database.php","database.json","db.php","db.json",
+    "app.config","web.config","appsettings.json","application.yml",
+    "application.properties","bootstrap.php","parameters.yml",
+    "local.xml","site.conf","nginx.conf","httpd.conf","apache2.conf",
+    "php.ini","global.conf","main.conf",
+    # ── Backups ───────────────────────────────────────────────────────────────
+    "backup","backup.zip","backup.tar.gz","backup.tar","backup.sql",
+    "backup.bak","backup.old","backup.orig","site.bak","site.zip",
+    "site-backup.zip","database.sql","db.sql","db.backup","dump.sql",
+    "mysqldump.sql","data.sql","data.zip","data.bak","archive.zip",
+    "www.zip","html.zip","public.zip","old","bak","archive","archives",
+    "backup2","backup_old","backup_new","latest_backup.sql",
+    "_backup","__backup","temp_backup","full_backup.sql",
+    # ── Info Disclosure ───────────────────────────────────────────────────────
+    "robots.txt","sitemap.xml","sitemap_index.xml",".htaccess","web.config",
+    "phpinfo.php","info.php","test.php","server-status","server-info",
+    "readme.txt","README.md","CHANGELOG.md","CHANGELOG.txt","VERSION",
+    "version.txt","INSTALL.md","LICENSE","COPYING","NOTICE",
+    "crossdomain.xml","clientaccesspolicy.xml","security.txt",
+    ".well-known/security.txt",".well-known/change-password",
+    ".htpasswd","access_log","error_log","debug.log","app.log",
+    # ── API & Docs ────────────────────────────────────────────────────────────
+    "api","api/v1","api/v2","api/v3","api/v4","graphql",
+    "swagger","swagger-ui","swagger-ui.html","swagger.json","swagger.yaml",
+    "openapi.json","openapi.yaml","api-docs","api/docs","rest/v1",
+    "rest/v2","v1","v2","jsonrpc","xmlrpc.php","rpc","soap","wsdl",
+    # ── Files & Uploads ───────────────────────────────────────────────────────
+    "uploads","upload","files","file","images","img","assets","static",
+    "media","public","downloads","content","attachments","resources",
+    "data","raw","export","exports","import","tmp/uploads","temp/uploads",
+    # ── Dev & Debug ───────────────────────────────────────────────────────────
+    "test","testing","dev","develop","development","staging","stage",
+    "debug","trace","logs","log","console","error_log","access_log",
+    "tmp","temp","cache","__debug__","/_debug_toolbar",
+    "/_profiler","/_wdt","/_ah/admin","/_ah/stats",
+    "console","rails/info","rails/mailers","web-console",
+    # ── Shells & Dangerous ────────────────────────────────────────────────────
+    "shell.php","cmd.php","webshell.php","c99.php","r57.php","b374k.php",
+    "sh.php","php-shell.php","php_shell.php","pass.php","p.php","x.php",
+    "1.php","0.php","cmd","exec","command","run","cgi-bin/cmd",
+    "cgi-bin/shell","cgi-bin/admin.cgi","cgi-bin/test.cgi",
+    # ── Version Control ───────────────────────────────────────────────────────
+    ".svn",".svn/entries",".svn/wc.db",".hg",".hg/store",
+    ".bzr",".DS_Store","Thumbs.db",
+    # ── Sensitive Files ───────────────────────────────────────────────────────
+    "credentials","credentials.json","credentials.xml","credentials.yaml",
+    "secrets.yml","secrets.json","private","private-key.pem",
+    "id_rsa","id_rsa.pub","keys","token","tokens","auth","authentication",
+    "passwd","shadow","etc/passwd","etc/shadow","proc/self/environ",
+    "wp-config.php.bak","config.php.bak","config.php.old","config.old",
+    ".npmrc",".pypirc",".pip/pip.conf","composer.json","composer.lock",
+    "package.json","package-lock.json","yarn.lock","Gemfile","Gemfile.lock",
+    "requirements.txt","Pipfile","Pipfile.lock","poetry.lock",
+    # ── CMS Specific ─────────────────────────────────────────────────────────
+    "wp-content","wp-includes","wp-json","xmlrpc.php","wp-cron.php",
+    "wp-login.php","wp-register.php","wp-signup.php",
+    "administrator","administrator/index.php","administrator/manifests",
+    "joomla.xml","configuration.php","magento","app/etc/local.xml",
+    "drupal","sites/default/settings.php","Drupal.version",
+    "typo3","typo3/sysext","concrete","concrete5","kcfinder",
+    # ── Framework & Tooling ───────────────────────────────────────────────────
+    "Dockerfile","docker-compose.yml","docker-compose.yaml",
+    ".dockerignore",".docker","kubernetes","k8s","helm","charts",
+    "terraform",".terraform","ansible","playbook.yml","Vagrantfile",
+    ".travis.yml",".github/workflows","Jenkinsfile","Makefile",
+    ".circleci/config.yml",".drone.yml",
+    # ── Cloud & Infra ─────────────────────────────────────────────────────────
+    "aws","gcp","azure",".aws/credentials",".azure","cloud.yml",
+    "serverless.yml","cdk.json","pulumi.yaml","helm/values.yaml",
+    # ── Monitoring & Health ───────────────────────────────────────────────────
+    "health","health-check","healthz","ping","status","metrics",
+    "actuator","actuator/env","actuator/health","actuator/info",
+    "actuator/mappings","actuator/beans","actuator/logfile",
+    "prometheus","grafana","kibana","elastic","elastic/search",
+    # ── Mail & Communication ──────────────────────────────────────────────────
+    "mail","webmail","roundcube","squirrelmail","horde","owa",
+    "exchange","autodiscover","autodiscover/autodiscover.xml",
+    # ── Database Interfaces ───────────────────────────────────────────────────
+    "phpmyadmin","pma","myadmin","mysql","mysqladmin","pgadmin",
+    "adminer","adminer.php","adminer-4.8.1.php","db","database",
+    "mongo","mongodb","redis","memcached","elasticsearch",
+    # ── Misc ─────────────────────────────────────────────────────────────────
+    "server","system","network","internal","private","secret","hidden",
+    "old","new","dev","qa","uat","preprod","prod","live",
+    "v1","v2","v3","beta","alpha","rc","release",
+    "crm","erp","billing","invoice","payment","checkout","cart",
+    "webhook","webhooks","callback","notify","notification",
+    "cron","jobs","tasks","scheduler","queue","worker",
+    "socket","ws","websocket","long-poll","events","sse",
+    ".well-known","security","audit","compliance","report","reports",
+    "analytics","stats","statistics","tracking","pixel","beacon",
+    "affiliate","partner","reseller","vendor","supplier",
+    "license","licenseserver","activation","register","serial",
+    "sitemap","feed","rss","atom","podcast","media-feed",
+    "crossdomain.xml",".json","api.json","endpoints","routes",
+    "map","maps","geoip","location","geolocation",
+]
+
+
+class DirScanner:
+    def __init__(self, target: str, wordlist_path: str,
+                 stealth: StealthEngine, threads: int = 25, timeout: int = 5):
+        self.target       = target.rstrip("/")
+        self.wordlist_path = wordlist_path
+        self.stealth      = stealth
+        self.threads      = threads
+        self.timeout      = timeout
+        self.found        = []
+        self._scanned     = 0
+
+    def _load(self) -> list:
+        try:
+            with open(self.wordlist_path) as f:
+                words = [l.strip() for l in f
+                         if l.strip() and not l.startswith("#")]
+            info(f"Wordlist: {self.wordlist_path}  ({len(words)} paths)")
+            return words
+        except FileNotFoundError:
+            warn(f"Wordlist not found — using built-in ({len(DEFAULT_WORDLIST)} paths)")
+            return DEFAULT_WORDLIST
+
+    def _check(self, path: str):
+        url = f"{self.target}/{path}"
+        self.stealth.wait()
+        try:
+            r = requests.get(url,
+                             headers=self.stealth.headers(),
+                             timeout=self.timeout,
+                             verify=False,
+                             allow_redirects=False)
+            self._scanned += 1
+            if r.status_code in (200, 204, 301, 302, 307, 403, 405):
+                return {
+                    "url":    url,
+                    "path":   path,
+                    "status": r.status_code,
+                    "size":   len(r.content),
+                    "server": r.headers.get("Server", ""),
+                }
+        except Exception:
+            self._scanned += 1
+        return None
+
+    def run(self) -> list:
+        section("Phase 3 — Directory & File Discovery")
+        paths = self._load()
+        total = len(paths)
+        info(f"Scanning {total} paths  |  threads: {self.threads}  |  "
+             f"stealth: {self.stealth.mode}")
+        print()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as ex:
+            futures = [ex.submit(self._check, p) for p in paths]
+            done = 0
+            for f in concurrent.futures.as_completed(futures):
+                done += 1
+                progress(f"  Progress: {done}/{total}  "
+                         f"Found: {len(self.found)}")
+                r = f.result()
+                if not r:
+                    continue
+                self.found.append(r)
+                is_sens = any(k in r["url"].lower() for k in SENSITIVE_KEYS)
+                print()  # clear progress line
+                if r["status"] == 200 and is_sens:
+                    sev("High",   f"[200] {r['url']}  ({r['size']}B)  ← SENSITIVE")
+                elif r["status"] == 200:
+                    sev("Info",   f"[200] {r['url']}  ({r['size']}B)")
+                elif r["status"] in (301, 302, 307):
+                    sev("Low",    f"[{r['status']}] {r['url']}  (redirect)")
+                elif r["status"] == 403:
+                    sev("Low",    f"[403] {r['url']}  (forbidden — exists)")
+                elif r["status"] == 405:
+                    sev("Info",   f"[405] {r['url']}  (method not allowed)")
+
+        print()
+        ok(f"Discovery done — {len(self.found)} paths found / {total} tested")
+        return self.found
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHASE 4 — HEADERS & SSL
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HeadersSSLChecker:
+    REQUIRED = {
+        "strict-transport-security": ("High",   "HSTS missing — downgrade attack risk"),
+        "content-security-policy":   ("High",   "CSP missing — XSS attack surface"),
+        "x-frame-options":           ("Medium", "X-Frame-Options missing — clickjacking risk"),
+        "x-content-type-options":    ("Low",    "X-Content-Type-Options missing"),
+        "referrer-policy":           ("Low",    "Referrer-Policy missing"),
+        "permissions-policy":        ("Low",    "Permissions-Policy missing"),
+    }
+
+    def __init__(self, target: str, stealth: StealthEngine, timeout: int = 10):
+        self.target  = target
+        self.stealth = stealth
+        self.timeout = timeout
+        self.findings = []
+
+    def run(self) -> list:
+        section("Phase 4 — Headers & SSL/TLS")
+        self._headers()
+        self._ssl()
+        return self.findings
+
+    def _headers(self):
+        info("Checking security headers ...")
+        try:
+            r = requests.get(self.target,
+                             headers=self.stealth.headers(),
+                             timeout=self.timeout,
+                             verify=False)
+            h = {k.lower(): v for k, v in r.headers.items()}
+
+            for hdr, (lvl, msg) in self.REQUIRED.items():
+                if hdr not in h:
+                    sev(lvl, msg)
+                    self.findings.append({"type":"Missing Header","header":hdr,
+                                          "severity":lvl,"detail":msg})
+                else:
+                    ok(f"{hdr}: {h[hdr][:70]}")
+
+            # Information leakage
+            for leaky in ("server","x-powered-by","x-aspnet-version","x-generator"):
+                if leaky in h:
+                    sev("Info", f"{leaky} discloses: {h[leaky]}")
+                    self.findings.append({"type":"Info Disclosure","severity":"Low",
+                                          "detail":f"{leaky}: {h[leaky]}"})
+
+            # Cookies
+            all_set_cookie = r.headers.get("Set-Cookie","")
+            if all_set_cookie:
+                if "httponly" not in all_set_cookie.lower():
+                    sev("Medium","Cookie missing HttpOnly flag")
+                    self.findings.append({"type":"Cookie","severity":"Medium",
+                                          "detail":"Missing HttpOnly"})
+                if "secure" not in all_set_cookie.lower():
+                    sev("Medium","Cookie missing Secure flag")
+                    self.findings.append({"type":"Cookie","severity":"Medium",
+                                          "detail":"Missing Secure"})
+                if "samesite" not in all_set_cookie.lower():
+                    sev("Low","Cookie missing SameSite flag")
+
+            # CORS
+            if "access-control-allow-origin" in h:
+                val = h["access-control-allow-origin"]
+                if val == "*":
+                    sev("Medium","CORS misconfiguration — Access-Control-Allow-Origin: *")
+                    self.findings.append({"type":"CORS","severity":"Medium",
+                                          "detail":"Wildcard CORS"})
+
+        except Exception as e:
+            warn(f"Header check failed: {e}")
+
+    def _ssl(self):
+        parsed = urlparse(self.target)
+        if parsed.scheme != "https":
+            sev("High","Site does not use HTTPS!")
+            self.findings.append({"type":"SSL","severity":"High","detail":"No HTTPS"})
+            return
+        info("Checking SSL/TLS ...")
+        try:
+            ctx = ssl.create_default_context()
+            with ctx.wrap_socket(socket.socket(),
+                                 server_hostname=parsed.hostname) as conn:
+                conn.settimeout(self.timeout)
+                conn.connect((parsed.hostname, 443))
+                cert   = conn.getpeercert()
+                ver    = conn.version()
+
+            expiry    = datetime.strptime(cert["notAfter"],"%b %d %H:%M:%S %Y %Z")
+            days_left = (expiry - datetime.utcnow()).days
+            subject   = dict(x[0] for x in cert.get("subject",[]))
+            issuer    = dict(x[0] for x in cert.get("issuer", []))
+            ok(f"CN       : {subject.get('commonName','N/A')}")
+            ok(f"Issuer   : {issuer.get('organizationName','N/A')}")
+            ok(f"Protocol : {ver}")
+
+            if days_left < 14:
+                sev("Critical",f"Certificate expires in {days_left} days!")
+                self.findings.append({"type":"SSL Expiry","severity":"Critical",
+                                      "detail":f"Expires in {days_left} days"})
+            elif days_left < 30:
+                sev("High",    f"Certificate expires in {days_left} days")
+            elif days_left < 90:
+                sev("Medium",  f"Certificate expires in {days_left} days")
+            else:
+                ok(f"Certificate valid — expires {expiry.date()} ({days_left}d)")
+
+            if ver in ("TLSv1","TLSv1.1"):
+                sev("High", f"Outdated TLS version: {ver}")
+                self.findings.append({"type":"Weak TLS","severity":"High","detail":ver})
+
+        except ssl.SSLError as e:
+            sev("High",f"SSL error: {e}")
+            self.findings.append({"type":"SSL Error","severity":"High","detail":str(e)})
+        except Exception as e:
+            warn(f"SSL check failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHASE 5 — AI ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AIAnalyzer:
+    SYS = ("You are a senior penetration tester and security researcher. "
+           "Analyze the provided scan results and write a professional "
+           "security report in English.")
+
+    def __init__(self, api_key: str = None):
+        self.client = anthropic.Anthropic(api_key=api_key) if api_key \
+                      else anthropic.Anthropic()
+
+    def analyze(self, findings: dict) -> str:
+        section("Phase 5 — AI Analysis (Claude)")
+        info("Sending results to Claude AI ...")
+        prompt = f"""Analyze the following vulnerability scan results and provide:
+
+1. Executive Summary (2-3 sentences on overall security posture)
+2. Top 3 Critical Findings (explain each: what it is, how it can be exploited, CVSS estimate)
+3. Remediation Steps (practical code/config fixes for each critical finding)
+4. Additional Hardening Recommendations
+
+Scan Results:
+```json
+{json.dumps(findings, ensure_ascii=False, indent=2)}
+```
+
+Write clearly and professionally. Include code snippets where relevant."""
+
+        try:
+            msg = self.client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=2500,
+                system=self.SYS,
+                messages=[{"role":"user","content":prompt}]
+            )
+            text = msg.content[0].text
+            print(f"\n{Fore.GREEN}{text}{Style.RESET_ALL}")
+            return text
+        except Exception as e:
+            fail(f"Claude API error: {e}")
+            return f"Error: {e}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REPORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_report(findings: dict, path: str):
+    report = {"tool":"bsam TX VulnScanner","version":"2.5",
+              "scan_date":datetime.now().isoformat(),"findings":findings}
+    with open(path,"w",encoding="utf-8") as f:
+        json.dump(report,f,ensure_ascii=False,indent=2)
+    ok(f"Report saved: {path}")
+
+
+def print_summary(findings: dict, elapsed: int):
+    section("Scan Summary")
+    web  = findings.get("web_vulns",  [])
+    hdrs = findings.get("headers_ssl",[])
+    dirs = findings.get("directories",[])
+    all_f = web + hdrs
+
+    counts = {s: sum(1 for x in all_f if x.get("severity")==s)
+              for s in ("Critical","High","Medium","Low")}
+
+    print(f"  {Fore.RED}Critical : {counts['Critical']:3d}{Style.RESET_ALL}  "
+          f"{Fore.LIGHTRED_EX}High   : {counts['High']:3d}{Style.RESET_ALL}  "
+          f"{Fore.YELLOW}Medium : {counts['Medium']:3d}{Style.RESET_ALL}  "
+          f"{Fore.CYAN}Low  : {counts['Low']:3d}{Style.RESET_ALL}")
+    print(f"  Paths found  : {len(dirs)}")
+    print(f"  Total issues : {len(all_f)}")
+    print(f"  Elapsed      : {elapsed}s")
+
+    if counts["Critical"] > 0:
+        print(f"\n  {Fore.RED}[!] CRITICAL issues found — fix immediately!{Style.RESET_ALL}")
+    elif counts["High"] > 0:
+        print(f"\n  {Fore.YELLOW}[!] HIGH-severity issues found.{Style.RESET_ALL}")
+    else:
+        print(f"\n  {Fore.GREEN}[+] No critical or high issues detected.{Style.RESET_ALL}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="bsam TX — Web Vulnerability Scanner v2.5",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python scanner.py -u https://testsite.com
+  python scanner.py -u https://testsite.com --ai
+  python scanner.py -u https://testsite.com --stealth stealth --ai
+  python scanner.py -u https://testsite.com -w wordlists/full500.txt -o report.json
+  python scanner.py -u https://testsite.com --skip recon headers --stealth ghost
+  python scanner.py -u https://testsite.com --threads 40 --timeout 8
+        """
+    )
+    parser.add_argument("-u","--url",      required=True,
+                        help="Target URL")
+    parser.add_argument("-w","--wordlist", default="wordlists/full500.txt",
+                        help="Path to wordlist file")
+    parser.add_argument("-o","--output",   default="report.json",
+                        help="Output report file (JSON)")
+    parser.add_argument("--ai",            action="store_true",
+                        help="Enable Claude AI analysis")
+    parser.add_argument("--api-key",       help="Anthropic API Key")
+    parser.add_argument("--stealth",       default="normal",
+                        choices=["normal","stealth","ghost"],
+                        help="Stealth level: normal / stealth / ghost")
+    parser.add_argument("--threads",       type=int, default=25,
+                        help="Directory scan threads (default: 25)")
+    parser.add_argument("--timeout",       type=int, default=10,
+                        help="Request timeout in seconds (default: 10)")
+    parser.add_argument("--skip",          nargs="+", default=[],
+                        choices=["recon","web","dirs","headers"],
+                        help="Skip specific phases")
+    args = parser.parse_args()
+
+    banner()
+
+    if not args.url.startswith(("http://","https://")):
+        args.url = "https://" + args.url
+
+    parsed  = urlparse(args.url)
+    domain  = parsed.hostname
+    start   = datetime.now()
+    stealth = StealthEngine(mode=args.stealth)
+
+    print(f"  {Fore.CYAN}Target  :{Style.RESET_ALL} {args.url}")
+    print(f"  {Fore.CYAN}Domain  :{Style.RESET_ALL} {domain}")
+    print(f"  {Fore.CYAN}Stealth :{Style.RESET_ALL} {args.stealth}")
+    print(f"  {Fore.CYAN}Started :{Style.RESET_ALL} {start.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  {Fore.RED}[!] Only use on systems you are authorized to test!{Style.RESET_ALL}")
+
+    all_findings = {"target": args.url}
+
+    if "recon"   not in args.skip:
+        all_findings["recon"]        = Recon(domain, args.url, stealth).run()
+    if "web"     not in args.skip:
+        all_findings["web_vulns"]    = WebVulnScanner(args.url, stealth, args.timeout).run()
+    if "dirs"    not in args.skip:
+        all_findings["directories"]  = DirScanner(
+            args.url, args.wordlist, stealth, args.threads,
+            max(3, args.timeout // 2)).run()
+    if "headers" not in args.skip:
+        all_findings["headers_ssl"]  = HeadersSSLChecker(args.url, stealth, args.timeout).run()
+    if args.ai:
+        all_findings["ai_analysis"]  = AIAnalyzer(args.api_key).analyze(all_findings)
+
+    elapsed = int((datetime.now() - start).total_seconds())
+    print_summary(all_findings, elapsed)
+    save_report(all_findings, args.output)
+
+
+if __name__ == "__main__":
+    main()
+
